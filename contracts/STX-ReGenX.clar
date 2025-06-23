@@ -193,3 +193,119 @@
                 })
             (var-set asset-counter asset-id)
             (ok asset-id))))
+
+
+;; Enhanced Share Purchase
+(define-public (purchase-shares (asset-id uint) (share-count uint))
+    (let ((asset (unwrap! (map-get? assets { asset-id: asset-id })
+                          ERR-ASSET-NOT-FOUND))
+          (current-ownership (default-to 
+                                { 
+                                    shares: u0, 
+                                    revenue-claimed: u0,
+                                    last-claim-height: stacks-block-height,
+                                    voting-power: u0
+                                }
+                                (map-get? ownership 
+                                    { asset-id: asset-id, owner: tx-sender }))))
+        (asserts! (> share-count u0) ERR-ZERO-SHARES)
+        (asserts! (<= share-count (get available-shares asset)) 
+                 ERR-INSUFFICIENT-SHARES)
+        (asserts! (is-eq (get status asset) "active") ERR-INVALID-STATUS)
+
+        (let ((cost (* share-count (get share-price asset)))
+              (new-voting-power (calculate-voting-power 
+                                (+ share-count (get shares current-ownership))
+                                (get total-shares asset))))
+            (begin
+                (try! (stx-transfer? cost tx-sender (as-contract tx-sender)))
+                (map-set assets
+                    { asset-id: asset-id }
+                    (merge asset {
+                        available-shares: (- (get available-shares asset) 
+                                           share-count),
+                        last-updated: stacks-block-height
+                    }))
+                (map-set ownership
+                    { asset-id: asset-id, owner: tx-sender }
+                    {
+                        shares: (+ (get shares current-ownership) share-count),
+                        revenue-claimed: (get revenue-claimed current-ownership),
+                        last-claim-height: (get last-claim-height current-ownership),
+                        voting-power: new-voting-power
+                    })
+                (ok true)))))
+
+;; Revenue Management
+(define-public (distribute-revenue (asset-id uint) (amount uint))
+    (let ((asset (unwrap! (map-get? assets { asset-id: asset-id })
+                          ERR-ASSET-NOT-FOUND)))
+        (begin
+            (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+            (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+            (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+
+            (let ((new-total-revenue (+ (get total-revenue asset) amount))
+                  (new-revenue-per-share (/ new-total-revenue 
+                                          (get total-shares asset))))
+                (map-set assets
+                    { asset-id: asset-id }
+                    (merge asset {
+                        total-revenue: new-total-revenue,
+                        revenue-per-share: new-revenue-per-share,
+                        last-updated: stacks-block-height
+                    }))
+                (ok true)))))
+
+;; Governance Functions
+(define-public (submit-proposal 
+    (asset-id uint)
+    (proposal-type (string-ascii 20))
+    (description (string-ascii 500))
+    (amount uint))
+    (let ((proposal-id (+ (var-get proposal-counter) u1))
+          (settings (unwrap! (map-get? governance-settings { asset-id: asset-id })
+                            ERR-ASSET-NOT-FOUND))
+          (ownership-info (unwrap! (map-get? ownership 
+                                    { asset-id: asset-id, owner: tx-sender })
+                                  ERR-NOT-AUTHORIZED)))
+        (begin
+            (asserts! (>= (get voting-power ownership-info) 
+                         (/ SHARE-SCALE u20)) ;; 5% minimum
+                     ERR-INSUFFICIENT-SHARES)
+
+            (map-set proposals
+                { asset-id: asset-id, proposal-id: proposal-id }
+                {
+                    proposer: tx-sender,
+                    proposal-type: proposal-type,
+                    description: description,
+                    amount: amount,
+                    votes-for: u0,
+                    votes-against: u0,
+                    status: "active",
+                    start-height: stacks-block-height,
+                    end-height: (+ stacks-block-height (get vote-period settings)),
+                    execution-delay: (get cooldown-period settings),
+                    quorum-reached: false
+                })
+            (var-set proposal-counter proposal-id)
+            (ok proposal-id))))
+
+;; Read-only Functions
+(define-read-only (get-asset-info (asset-id uint))
+    (map-get? assets { asset-id: asset-id }))
+
+(define-read-only (get-ownership-info (asset-id uint) (owner principal))
+    (map-get? ownership { asset-id: asset-id, owner: owner }))
+
+(define-read-only (get-asset-metrics (asset-id uint))
+    (map-get? asset-metrics { asset-id: asset-id }))
+
+(define-read-only (get-governance-settings (asset-id uint))
+    (map-get? governance-settings { asset-id: asset-id }))
+
+(define-read-only (get-proposal-info 
+    (asset-id uint)
+    (proposal-id uint))
+    (map-get? proposals { asset-id: asset-id, proposal-id: proposal-id }))
